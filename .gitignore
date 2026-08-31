@@ -5,3 +5,12 @@ venv/
 *.log
 .DS_Store
 references/*.pdf
+
+# LaTeX build artifacts (paper/)
+paper/*.aux
+paper/*.bbl
+paper/*.blg
+paper/*.log
+paper/*.out
+paper/*.toc
+paper/*.synctex.gz

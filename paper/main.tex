@@ -1,0 +1,189 @@
+\documentclass[conference]{IEEEtran}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{url}
+\usepackage[hidelinks]{hyperref}
+
+\title{Closed-Form Continuous-Time Networks for Native Asynchronous Sensor Fusion in Contact-Rich Manipulation}
+\author{\IEEEauthorblockN{Nahul Alaguraj}
+\IEEEauthorblockA{\textit{Robotic Perception Course, Digital Assignment}}
+\and
+\IEEEauthorblockN{Akhilesh Manchi}
+\IEEEauthorblockA{\textit{Robotic Perception Course, Digital Assignment}}
+\and
+\IEEEauthorblockN{Hanish Vigneshwar}
+\IEEEauthorblockA{\textit{Robotic Perception Course, Digital Assignment}}
+}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Robotic manipulation in contact-rich settings requires fusing sensor streams that operate at fundamentally different rates and irregular intervals: proprioceptive and joint-torque sensing at approximately 1~kHz, vision-based tactile sensors at 25--60~Hz, and camera vision at 30--60~Hz, often with variable latency, jitter, and dropout. Existing approaches treat this asynchrony as a preprocessing problem, resampling or interpolating all modalities onto a shared clock before feeding a standard recurrent- or transformer-based policy. We argue that this discards timing information, introduces artificial latency, and aliases contact transients, and we propose instead to exploit the native continuous-time structure of Liquid Time-Constant (LTC) and Closed-form Continuous-time (CfC) networks, whose input-dependent time constants integrate irregularly timestamped signals directly, without a common sampling grid. We build a closed-loop imitation-learning manipulation policy that consumes raw, asynchronously timestamped tactile (GelSight/DIGIT), proprioceptive, and visual streams, and evaluate it on contact-rich tasks---slip-reactive grasping and peg-in-hole insertion---on a Franka Panda arm, in high-fidelity simulation and on real hardware. Against equal-parameter LSTM, TCN, and Transformer baselines operating on resampled input, as well as a CfC operating on synchronized input (which isolates the fusion benefit from the architecture benefit), we test whether native asynchronous fusion improves task success, sample efficiency, robustness to sensor dropout and test-time rate variation, and closed-loop latency. Our results characterize when and why continuous-time liquid architectures offer a genuine advantage over conventional discrete-time fusion for physical interaction tasks, and provide the first evaluation of liquid networks on multimodal, contact-rich robotic manipulation.
+\end{abstract}
+
+\begin{IEEEkeywords}
+Liquid neural networks; closed-form continuous-time networks; multi-rate sensor fusion; contact-rich manipulation; tactile sensing; asynchronous time-series modeling; robot learning; edge deployment.
+\end{IEEEkeywords}
+
+\section{Introduction}
+\label{sec:intro}
+Contact-rich manipulation tasks---such as peg-in-hole insertion, in-hand reorientation, and cable routing---require tight integration of visual, tactile, and proprioceptive feedback. In practice, these sensing modalities operate at fundamentally different and often jittery frequencies. On a Franka Panda arm, proprioception and joint-torque sensing are available at approximately 1~kHz through the real-time \texttt{libfranka} interface, whereas the vision-based tactile sensors commonly used for grasp- and contact-rich control, GelSight Mini and DIGIT, stream at 25--30~Hz, and RGB cameras at 30--60~Hz \cite{franka_libfranka,yuan2017gelsight,lambeta2020digit}. The resulting 20--40$\times$ rate disparity is compounded by real communication pipelines: USB camera stacks exhibit 50--200~ms end-to-end latency and 1--50~ms scheduling jitter, ROS~2 camera topics commonly show 30--90~ms delay under load, and multi-sensor data-collection setups report 20--80~ms of unmeasured inter-sensor jitter, with periodic packet dropouts when image traffic saturates shared buses.
+
+Standard learning-based control pipelines address this asynchrony by resampling all streams to a least-common-denominator clock using zero-order holds (ZOH) or interpolation. This approach introduces three distinct pathologies. First, it discards timing information: the network never observes \emph{when} a tactile frame or joint reading actually arrived, only a held or interpolated value on an artificial grid. Second, it introduces artificial latency, since the pipeline must buffer and align streams before a synchronized observation tuple can be emitted. Third, it aliases high-frequency contact transients: slip onset and impact spikes that evolve on millisecond timescales are filtered through a 25--50~Hz common grid that cannot represent them. The result is a rigid temporal structure that does not reflect the underlying physics of sensing.
+
+Liquid Time-Constant (LTC) networks \cite{hasani2021ltc} and their closed-form continuous-time (CfC) variants \cite{hasani2022cfc} offer a structurally different solution. By defining hidden-state evolution through ordinary differential equations whose per-neuron time constants are modulated by the instantaneous input, these models treat \emph{elapsed time as a first-class input} rather than a fixed step size. A sequence of irregularly timestamped observations can be integrated directly between consecutive observation times, with no resampling, buffering, or common clock. Moreover, the closed-form approximation of the CfC eliminates numerical ODE solvers entirely: each update is a single closed-form evaluation with the wall-clock cost of a conventional RNN step, reported to be one to five orders of magnitude faster than solver-based continuous-time counterparts \cite{hasani2022cfc}. The original CfC authors explicitly highlight robotics and closed-loop control as target domains where data irregularities are the norm, not the exception.
+
+Nevertheless, every existing LNN robotics application we have identified---whether vision-based flight navigation \cite{chahine2023flight}, multi-agent flocking \cite{marino2024lgtc}, oil-spill tracking with marine swarms \cite{kuzmenko2025oil}, manipulator inverse kinematics and dynamics \cite{zhang2025invertible}, sliding-mode control with CfC gravity compensation \cite{urrea2024smc}, or the most recent liquid imitation-learning results of Correll \cite{correll2026liquid}---feeds the network a single modality at a uniform sampling rate. The architecture's native capability for asynchronous, irregularly sampled, multi-rate data remains entirely unexploited in robotic manipulation. Independent reviews confirm both the family's strengths on noisy, non-stationary, irregularly-sampled data and the absence of any robotics system that exploits these dynamics for sensor fusion \cite{zong2025comparative}.
+
+This paper presents a manipulation controller that ingests raw, timestamped streams from vision, tactile (GelSight/DIGIT), and proprioception directly into a CfC backbone, without resampling or alignment to a common clock. Our contributions are:
+\begin{itemize}
+\item \textbf{Native asynchronous fusion.} To the best of our knowledge, the first application of LTC/CfC networks to truly asynchronous, multi-rate, multimodal sensor data in manipulation, in which each arriving sensor packet triggers a hidden-state update carrying its true elapsed time $\Delta t$.
+\item \textbf{Controlled evaluation on contact-rich tasks.} A closed-loop imitation-learning policy evaluated on slip-reactive grasping and peg-in-hole insertion, in simulation and on a real Franka Panda arm.
+\item \textbf{Fusion-versus-architecture isolation.} An equal-parameter comparison against LSTM with ZOH, a temporal convolutional network (TCN), a Transformer with continuous time-encoded positional embeddings, and---critically---a CfC operating on synchronized input, which isolates the \emph{fusion benefit} of native asynchrony from the \emph{architecture benefit} of liquid dynamics.
+\item \textbf{Robustness characterization.} A systematic stress-test protocol covering sensor dropout, test-time rate variation, injected timestamp jitter, and latency sweeps.
+\end{itemize}
+
+Our central hypothesis is that native asynchronous fusion improves sample efficiency during imitation learning, enhances robustness to sensor dropout and test-time rate changes, and reduces closed-loop latency by eliminating the need for an artificial common clock. This directly addresses a gap that the liquid-networks community has flagged but not yet pursued: the CfC value proposition is built on handling irregular data, yet no robotics work has tested this claim on the irregular, multi-modal streams that real manipulators actually produce.
+
+\section{Related Work and Literature Review}
+\label{sec:related}
+
+\subsection{Liquid Neural Networks in Robotics}
+The liquid-network lineage descends from continuous-time recurrent architectures whose hidden states evolve under ordinary differential equations with input-dependent time constants. The original Liquid Time-Constant (LTC) network \cite{hasani2021ltc} established the core mechanism: a network of linear first-order dynamical systems whose time constants are themselves modulated by nonlinear gates, yielding theoretically stable dynamics with superior expressivity to comparable neural ODEs. The Closed-form Continuous-time (CfC) network \cite{hasani2022cfc} then derived a tightly bounded closed-form approximation to the LTC integral, eliminating ODE solvers and enabling one-to-five-orders-of-magnitude faster training and inference while preserving continuous-time semantics---including, notably, a roughly 160$\times$ training speedup over ODE-RNNs on the irregularly-sampled PhysioNet benchmark. Neural Circuit Policies (NCPs) \cite{lechner2020ncp} added biologically-inspired sparse wiring, demonstrating that a 19-neuron, 253-synapse liquid controller can outperform orders-of-magnitude larger networks in closed-loop driving, establishing the family's suitability for compact, robust, real-platform control.
+
+In robotics proper, this lineage has matured rapidly, though always under the constraint of single-modality, uniformly sampled inputs. The canonical vision-based result is the work of Chahine et al. \cite{chahine2023flight}, who demonstrated imitation-learned fly-to-target navigation on a quadrotor in \emph{Science Robotics}: the resulting policies generalized significantly beyond their training distributions---to forests, urban scenes, noise, and occlusion---and outperformed LSTM baselines in sim-to-real transfer. In multi-agent systems, Marino et al. \cite{marino2024lgtc} proposed the Liquid-Graph Time-Constant (LGTC) network, a continuous-time graph neural network for distributed flocking control that uses contraction analysis for stability guarantees and provides a closed-form variant that avoids per-iteration ODE solves. Kuzmenko et al. \cite{kuzmenko2025oil} integrated LTC trajectory models with coordinated marine swarm robots for autonomous oil-spill response, validated on Deepwater Horizon data, with LTC outperforming LSTM baselines by roughly 23\% spatial accuracy. For manipulator dynamics, Zhang et al. \cite{zhang2025invertible} introduced an invertible LNN framework for learning inverse kinematics and inverse dynamics on 6-DoF and 7-DoF platforms, motivated by unmodeled effects such as joint friction, compliance, and payload variation; Urrea et al. \cite{urrea2024smc} developed a sliding-mode controller for a UR5 that uses a CfC network to learn gravity compensation and inverse dynamics, outperforming classic SMC and PID under load disturbances. Most recently, a March 2026 preprint by Correll \cite{correll2026liquid} showed that liquid recurrent policies with mixture-density heads achieve roughly half the parameter count, 2.4$\times$ lower offline prediction error, and 1.8$\times$ faster inference than diffusion policies on Push-T, RoboMimic Can, and PointMaze under matched conditions, with especially large sample-efficiency gains in low-data regimes.
+
+Despite this breadth, every cited work above processes either a single visual stream, a single joint-encoder stream, or multi-agent data fused at a unified timestep. None ingests genuinely asynchronous, multi-rate sensory input. A recent comparative review \cite{zong2025comparative} confirms the family's advantages in accuracy, memory efficiency, and OOD robustness on noisy, non-stationary, irregularly-sampled data, while flagging online/continual learning, stronger uncertainty quantification, and invariance to sensor noise and regime shifts as critical future directions---but identifies no robotics application that exploits native continuous-time dynamics for asynchronous multi-rate fusion.
+
+\subsection{Multi-Rate and Asynchronous Sensor Fusion in Manipulation}
+The broader robotics community has long recognized multi-rate fusion as an engineering challenge rather than a modeling opportunity. Classical approaches force a common discrete clock. Kalman-filter-based synchronization \cite{kalman1960} runs prediction at the fastest sensor rate and applies measurement updates only when slower packets arrive, with zero-order holds or interpolation buffers extrapolating missing low-rate measurements; nonuniform dual-rate EKF variants remain standard practice in mobile-robot path following, where control actions are applied under ZOH conditions \cite{piza2022multirate}. Approximate-time message filters in ROS buffer streams and emit synchronized tuples only when timestamps fall within a user-defined tolerance, otherwise dropping packets. These approaches are ubiquitous in control stacks (IMU+GPS, vision+force/torque, multi-camera SLAM) and introduce exactly the information loss, latency, and aliasing described in Section~\ref{sec:intro}.
+
+Recent work has begun to treat asynchrony more carefully, though still through explicit alignment. In autonomous driving, velocity-driven bird's-eye-view models compensate radar/LiDAR-camera temporal misalignment by transforming points into the current ego frame and using velocity cues, improving IoU substantially at large latencies \cite{hayes2024velocity}. In rehabilitation robotics, asynchronous fusion frameworks explicitly separate sensor sampling rates from decision-making frequencies---force/torque sensors at 1~kHz, vision at 30~Hz---sometimes maintaining semantic state pools with time-to-live tokens so that high-rate force data and low-rate vision update independently. Closest to our setting, Krohn et al. \cite{krohn2026mitas} proposed MiTaS (Multi-Resolution Tactile Sensing), which fuses an RGB camera, a GelSight Mini, and a high-frequency event-based Evetac sensor using modality-specific convolutional stems and Transformer fusion, achieving an average 80\% success rate across five contact-rich tasks versus 31\% (vision-only) and 54\% (visual-tactile) baselines. MiTaS demonstrates the value of multi-rate tactile fusion, but it still forms discrete observation tokens that are aligned for a downstream flow-matching policy; it does not exploit continuous-time dynamics. Event cameras \cite{gallego2020event} supply the purest positive contrast---asynchronous per-pixel events with microsecond timestamps, treated as continuous-time point processes---but downstream models still typically convert events to frames for conventional networks. These works underscore the need for fusion strategies that respect the native temporal structure of each sensing process; none provide it.
+
+\subsection{Machine Learning for Irregularly-Sampled Time Series}
+A parallel strand in machine learning has developed models that natively accept irregular timestamps, though almost exclusively for healthcare (PhysioNet, MIMIC-III), climate, and synthetic benchmarks rather than robotic streams. GRU-D \cite{che2018grud} extends the GRU with trainable exponential decay terms on inputs and hidden states driven by the time interval since each variable's last observation. Neural ODEs \cite{chen2018node} define hidden-state evolution as a continuous vector field integrated between irregular observations; Latent ODE / ODE-RNN \cite{rubanova2019latent} combines this with recognition networks or per-observation RNN updates. Multi-Time Attention Networks (mTAN) \cite{shukla2021mtan} embed absolute timestamps continuously and use multi-head attention between observed time points and reference query times. Neural CDEs \cite{kidger2020ncde} drive the hidden state by a controlled differential equation along a continuous interpolation of the observations, universally approximating continuous functionals of the path. Set-function variants such as SeFT \cite{horn2020seft} treat an irregular series as an unordered set of (time, value) pairs processed with permutation-invariant attention.
+
+These methods are the natural methodological competitors, and they supply two key pieces of supporting evidence for our approach: continuous-time hidden states demonstrably outperform discrete-clock models on irregular data, and explicit time-interval decay (as in GRU-D) helps. However, none has been validated on high-rate multimodal robotic streams with physical contact dynamics. Moreover, the ODE-solver-based family (Neural ODE, Latent ODE, Neural CDE) is expensive for real-time control, whereas the CfC supplies a closed-form evaluation with conventional-RNN wall-clock cost \cite{hasani2022cfc}. And none exploits \emph{input-dependent liquid time constants} that automatically adapt the integration speed to the instantaneous sensor context---the core LTC/CfC mechanism that makes native multi-rate fusion possible without extra decay or interpolation layers. Strand~A (Section~\ref{sec:related}) supplies the robotics motivation; Strand~B supplies the ML baselines whose continuous-time inductive bias we inherit and whose robotic absence we fill.
+
+\subsection{Tactile Sensing and Multimodal Policies for Contact-Rich Control}
+Tactile feedback is critical for manipulation under contact uncertainty. GelSight-type sensors \cite{yuan2017gelsight} reconstruct high-resolution surface geometry from photometric stereo and infer shear force and slip from tracked marker displacement fields; DIGIT \cite{lambeta2020digit} provides a compact, low-cost, open-source vision-based tactile sensor now widely used for multi-finger manipulation. Slip detection typically relies on marker-displacement inhomogeneity, relative object-marker motion, shear-velocity rate-of-change, and contact transients; 25--30~Hz is the practical minimum for reliable vision-based slip detection, with force/torque sensing at up to 1~kHz supplying complementary high-bandwidth transients.
+
+The state of practice in multimodal imitation learning, however, assumes synchronized fixed-rate observations. Diffusion Policy \cite{chi2023diffusion} models action sequences as conditional denoising diffusion over observation features (observation horizon $T_o{=}2$, prediction horizon 16, action horizon 8) and typically runs at $\sim$10~Hz on real robots; ACT/ALOHA \cite{zhao2023act} predicts long action chunks ($k{\approx}100$, $\sim$2~s at 50~Hz) with temporal ensembling on a fixed 50~Hz clock; RoboMimic \cite{robomimic2021} provides the standard benchmark suite and evaluation protocol. On the representation side, T3 \cite{zhao2024t3} pre-trains a shared-trunk Transformer with sensor-specific encoders on a 3-million-image, 13-sensor Foundation Tactile dataset, improving long-horizon contact-rich policies such as precision electronics insertion at 0.4~mm clearance. Empirically, visual-tactile policies consistently outperform vision-only baselines on tight-tolerance assembly, reducing peak contact forces and raising success rates. Yet the intersection of tactile sensing and liquid neural networks is effectively empty in the published literature: existing LNN manipulation work---inverse-dynamics learning \cite{zhang2025invertible} or sliding-mode control \cite{urrea2024smc}---relies exclusively on proprioceptive state and incorporates no tactile or visual feedback at all. This leaves a clear opening for architectures that can fuse high-frequency contact events with lower-frequency visual frames without forcing either into an unnatural discrete-time grid.
+
+\subsection{Identified Research Gap}
+Three observations crystallize the remaining open problem. First, the liquid-network robotics catalog (Section~\ref{sec:related}) is confined to single modalities at uniform rates: vision-only navigation, proprioception-only dynamics, or multi-agent state messages---never the multi-rate tactile/proprioceptive/visual streams that real manipulators produce. Second, the robotics fusion literature treats asynchrony as a nuisance to be engineered away via resampling, prediction-correction, or token alignment---destroying the timing information that the sensing process actually provides. Third, the irregular-time-series ML literature has the right inductive bias but has never been brought to bear on robot control, and its solver-based representatives are too slow for closed-loop use.
+
+Two recent works sharpen the framing. The comparative review of Zong et al. \cite{zong2025comparative} explicitly calls out online/continual learning, stronger uncertainty quantification, and invariance to sensor noise and regime shifts as critical future directions for LNNs versus RNNs. The original CfC paper \cite{hasani2022cfc} further flags the unresolved theoretical question of whether safety verification is more tractable via the ODE representation or its closed form. Neither addresses the practical gap most directly enabled by the architecture itself: the absence of any LNN/CfC system that leverages native continuous-time dynamics for asynchronous, multi-rate sensor fusion in contact-rich manipulation. The CfC value proposition is built on handling irregular data, yet no robotics work has tested this claim on the irregular, multi-modal streams that manipulators actually produce. This paper targets that exact intersection.
+
+\section{Methodology}
+\label{sec:method}
+
+\subsection{Problem Formulation: Asynchronous Multimodal Streams}
+Let $\mathcal{M} = \{T, P, V\}$ denote the tactile, proprioceptive, and visual modalities. Each modality $m \in \mathcal{M}$ produces a stream of timestamped observations
+\begin{equation}\label{eq:stream}
+S_m = \bigl\{\bigl(t_m^{(i)},\, \mathbf{o}_m^{(i)}\bigr)\bigr\}_{i=1}^{N_m}, \qquad t_m^{(i+1)} - t_m^{(i)} \neq \mathrm{const},
+\end{equation}
+where the inter-sample intervals are irregular within a modality (jitter, dropout) and structurally different across modalities: $\Delta t_P \approx 1$~ms for Franka proprioception, $\Delta t_T \approx 33$--$40$~ms for GelSight/DIGIT tactile frames, and $\Delta t_V \approx 16$--$33$~ms for RGB vision. Let $\mathcal{E} = \{e_j\}_{j=1}^{N}$ denote the \emph{merged event stream} obtained by sorting all packets from all modalities by arrival time, so that $e_j = (t_j, m_j, \mathbf{o}_j)$ and $t_1 < t_2 < \cdots < t_N$.
+
+Standard pipelines construct a resampling operator $R_\Delta$ that maps $\{S_m\}$ onto a common grid $k\Delta$ via zero-order hold or interpolation, producing $\tilde{\mathbf{x}}(k\Delta)$ and discarding the true timestamps $\{t_j\}$. Our objective is instead a policy $\pi_\theta$ that consumes the merged event stream directly:
+\begin{equation}\label{eq:asyncpolicy}
+\mathbf{a}(t) = \pi_\theta\bigl(\{e_j : t_j \le t\}\bigr),
+\end{equation}
+in which elapsed time $\Delta t_j = t_j - t_{j-1}$ enters the model as an explicit input, and no buffer, hold, or alignment step precedes inference.
+
+\subsection{Continuous-Time Backbone: From LTC Dynamics to Closed Form}
+\paragraph{LTC dynamics.}
+The Liquid Time-Constant network \cite{hasani2021ltc} defines the hidden state $\mathbf{x}(t) \in \mathbb{R}^d$ through
+\begin{equation}\label{eq:ltc}
+\frac{d\mathbf{x}(t)}{dt} = -\left[\frac{1}{\tau} + f\bigl(\mathbf{x}(t), \mathbf{I}(t), \boldsymbol{\theta}\bigr)\right]\mathbf{x}(t) + A\, f\bigl(\mathbf{x}(t), \mathbf{I}(t), \boldsymbol{\theta}\bigr),
+\end{equation}
+where $f(\cdot)$ is a neural network with parameters $\boldsymbol{\theta}$, $\tau$ is a learnable base time-constant vector, $A$ is a bias/reversal-potential vector, and $\mathbf{I}(t)$ is the external input. The effective time constant of neuron $i$,
+\begin{equation}\label{eq:tau}
+\tau_{\mathrm{sys},i}(t) = \frac{\tau_i}{1 + \tau_i\, f_i\bigl(\mathbf{x}(t), \mathbf{I}(t)\bigr)},
+\end{equation}
+is \emph{input-dependent}---the defining ``liquid'' property. Because the dynamics are defined in continuous time, any sequence of timestamped observations can be integrated between consecutive observation times by advancing the state by the true $\Delta t$; no resampling is required.
+
+\paragraph{Closed-form approximation.}
+The CfC \cite{hasani2022cfc} derives a closed-form solution to the LTC integral. For a scalar neuron with initial state $x_0$, the approximation is
+\begin{equation}\label{eq:cfc}
+x(t) = (x_0 - A)\, e^{-\left[w_\tau + f(I(t),\theta)\right]t}\, f\bigl(-I(t), \theta\bigr) + A.
+\end{equation}
+In the practical multi-neuron gated form implemented in the \texttt{ncps} library \cite{lechner_ncps}, the update over an interval $\Delta t$ is
+\begin{equation}\label{eq:gate}
+\mathbf{h}_{t+\Delta t} = \mathbf{ff}_1 \odot \bigl(1 - \sigma_{\mathrm{interp}}\bigr) + \mathbf{ff}_2 \odot \sigma_{\mathrm{interp}}, \qquad \sigma_{\mathrm{interp}} = \operatorname{sigmoid}\!\bigl(-t_a\,\Delta t + t_b\bigr),
+\end{equation}
+where $\mathbf{ff}_1, \mathbf{ff}_2$ are learned backbone outputs, $t_a, t_b$ are learned time-gate parameters, and $\Delta t$ is the \emph{true elapsed time} since the previous update. Three properties make this backbone ideal for our setting. First, $\Delta t$ is an explicit, first-class input through the gate $\sigma_{\mathrm{interp}}$, so the network can learn to make large state changes after long gaps and small changes after short ones. Second, each update is a single closed-form evaluation---no ODE solver---with wall-clock cost comparable to a conventional RNN step, enabling kilohertz-rate closed-loop inference \cite{hasani2022cfc}. Third, the approximation error of the closed form is provably bounded, and mixed-memory variants (CfC + LSTM gating) are available for very long horizons.
+
+\subsection{Asynchronous Event-Driven Fusion Policy}
+\paragraph{Architecture.}
+The policy consists of (i) modality-specific encoders $E_T, E_P, E_V$---a small convolutional network for tactile frames (GelSight/DIGIT RGB images), an MLP for proprioception (joint positions, velocities, and end-effector wrench), and a CNN or small ViT for vision---producing feature vectors $\mathbf{z}_T, \mathbf{z}_P, \mathbf{z}_V$; (ii) a CfC backbone operating on the concatenated feature $\mathbf{x} = [\mathbf{z}_T; \mathbf{z}_P; \mathbf{z}_V]$; and (iii) an action head $D$ that decodes end-effector or joint-space commands from the hidden state. Optional per-modality age channels (time since each modality's last update) can be appended to $\mathbf{x}$ in an ablated variant.
+
+\paragraph{Event-driven update protocol.}
+The policy maintains a running hidden state $\mathbf{h}$ and a per-modality buffer holding the most recent encoded feature of each modality. Whenever \emph{any} sensor packet arrives, exactly one CfC update is performed:
+\begin{enumerate}
+\item Receive packet $e_j = (t_j, m_j, \mathbf{o}_j)$ from the merged event stream.
+\item Encode the arriving modality: $\mathbf{z}_{m_j} \leftarrow E_{m_j}(\mathbf{o}_j)$; update its buffer.
+\item Assemble the input $\mathbf{x}_j = [\mathbf{z}_T; \mathbf{z}_P; \mathbf{z}_V]$ from the latest features of all modalities.
+\item Compute the true elapsed time $\Delta t_j = t_j - t_{j-1}$.
+\item Update the hidden state: $\mathbf{h}_j \leftarrow \mathrm{CfC}(\mathbf{h}_{j-1}, \mathbf{x}_j, \Delta t_j)$.
+\item Decode the action $\mathbf{a}_j = D(\mathbf{h}_j)$ and emit it to the controller.
+\end{enumerate}
+This protocol is implemented directly through the \texttt{timespans} interface of the \texttt{ncps} PyTorch library \cite{lechner_ncps}: both \texttt{LTC} and \texttt{CfC} layers accept an optional per-step $\Delta t$ tensor of shape $(B, L)$, which replaces the default constant $\Delta t = 1$ in Eq.~\eqref{eq:gate}. Commands are emitted at a configurable control rate (e.g., 50~Hz) or at every proprioceptive packet (up to 1~kHz); because each CfC step is a single closed-form evaluation, higher command rates incur negligible compute. Training uses behavioral cloning on teleoperated demonstrations in which each observation packet retains its true timestamp, so the network never sees a synchronized grid.
+
+\subsection{Experimental Setup: Tasks, Hardware, and Simulation}
+\paragraph{Tasks.}
+Two contact-rich tasks are used. (i) \emph{Slip-reactive grasping}: the robot grasps objects of varying mass, friction, and geometry; slip onset detected in the tactile marker field must trigger grip-force modulation or regrasping within a bounded reaction window. (ii) \emph{Peg-in-hole insertion}: the robot inserts pegs with sub-millimeter clearances (0.1--0.5~mm) under varying initial pose offsets; success requires reacting to contact forces rather than executing a fixed trajectory.
+
+\paragraph{Hardware.}
+Experiments run on a Franka Panda 7-DoF torque-controlled arm. Proprioception (joint positions/velocities, joint torques, end-effector wrench) streams at 1~kHz via \texttt{libfranka} \cite{franka_libfranka}. Tactile sensing uses GelSight Mini (25~Hz) \cite{gelsight_sdk} and/or DIGIT (640$\times$480 @ 30~Hz) \cite{lambeta2020digit} sensors mounted on the gripper. Vision uses one or two wrist/overhead RGB cameras at 30--60~Hz. Streams are timestamped at source and transported without synchronization; the documented 20--80~ms real-world inter-sensor jitter supplies the natural test distribution.
+
+\paragraph{Simulation.}
+High-fidelity simulation uses robosuite \cite{zhu2020robosuite} (MuJoCo backend, Franka tasks, peg-insertion environments) with TACTO \cite{wang2022tacto} rendering DIGIT-style tactile images at hundreds of FPS. Simulation is idealized (perfectly synchronized streams), so asynchronous conditions are \emph{synthesized} during training by explicitly injecting the measured real-robot jitter and dropout distributions (Section~\ref{sec:method}), closing the temporal domain gap. Taxim \cite{si2021taxim} is available as an alternative example-based GelSight simulator for cross-simulator validation.
+
+\paragraph{Sim-to-real.}
+Domain randomization covers tactile image appearance (lighting, marker noise, gel color), physical parameters (friction, stiffness, object mass), and pose noise. Crucially, \emph{time-jitter augmentation} perturbs each inter-sample $\Delta t_j$ during training by additive noise drawn from the measured 20--80~ms real-robot jitter distribution and randomly drops packets, so the policy is trained directly on the corrupted timing it will encounter at deployment.
+
+\subsection{Baselines and Equal-Parameter Comparison}
+All baselines receive the same per-modality encoders and the same demonstration data; they differ only in how temporal information is handled. To ensure a fair comparison, the total trainable parameter count is matched within 5--10\% across all methods, and we report both parameter counts and wall-clock training/inference times. The four baselines and our method are summarized in Table~\ref{tab:baselines}.
+
+\begin{table*}[t]
+\centering
+\caption{Baseline comparison: fusion mechanism, temporal handling, and role in the study.}
+\label{tab:baselines}
+\begin{tabular}{@{}llll@{}}
+\toprule
+\textbf{Method} & \textbf{Fusion mechanism} & \textbf{Temporal handling} & \textbf{Role in study} \\
+\midrule
+LSTM + ZOH & Streams resampled to a fixed grid & Fixed $\Delta t$; discrete recurrence & Standard recurrent baseline \\
+TCN & Resampled features on a fixed grid & Fixed $\Delta t$; dilated causal conv. & Non-recurrent baseline \\
+Transformer (time-enc.) & Resampled; continuous time encodings & Attention over fixed grid & Attention baseline \\
+CfC (synchronized) & Resampled; constant $\Delta t$ & Continuous-time on uniform clock & Isolation ablation \\
+\textbf{CfC (async, ours)} & Raw timestamped packets & Liquid time constants, native clocks & \textbf{Full method} \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+The synchronized-CfC baseline is the critical control: it shares our backbone but receives uniformly resampled input, so any performance difference between it and our asynchronous CfC isolates the \emph{fusion benefit} of native asynchrony from the \emph{architecture benefit} of liquid dynamics. For context, Diffusion Policy \cite{chi2023diffusion} and ACT \cite{zhao2023act} are cited as the state of practice in fixed-clock multimodal policies ($\sim$10~Hz and 50~Hz control, respectively); we do not retrain them at matched parameter counts but reference their operating points.
+
+\subsection{Evaluation Protocol and Robustness Stress Tests}
+\paragraph{Primary metrics.}
+(i) \emph{Task success rate}: binary success averaged over 50 environment initializations $\times$ 3 seeds, following the Diffusion Policy / RoboMimic protocol \cite{chi2023diffusion,robomimic2021}. (ii) \emph{Sample efficiency}: success rate as a function of the number of demonstrations (e.g., 25, 50, 100, 200). (iii) \emph{Closed-loop latency}: end-to-end time from sensor packet arrival to command emission, measured on the real robot. (iv) \emph{Robustness}: success rate under each stress condition below.
+
+\paragraph{Stress tests.}
+At test time, without retraining, each stream is corrupted as follows:
+\begin{itemize}
+\item \textit{Sensor dropout}: randomly drop packets from each modality with probability $p \in \{0.1, 0.3, 0.5\}$.
+\item \textit{Rate variation}: stretch or compress inter-sample intervals by $\pm 50\%$ (simulating different sensor configurations or bandwidth constraints).
+\item \textit{Timestamp jitter}: add Gaussian noise $\mathcal{N}(0, \sigma)$ to packet timestamps, with $\sigma$ swept up to 80~ms.
+\item \textit{Latency injection}: delay each modality by 0--200~ms (constant and time-varying), emulating USB/ROS transport delays.
+\end{itemize}
+The central hypothesis is tested by comparing the asynchronous CfC against all four baselines on each metric, with the synchronized-CfC comparison serving as the fusion-isolating control. Success-rate degradation curves under dropout, jitter, and latency, together with latency and sample-efficiency measurements, constitute the primary evidence for or against the claimed advantage of native continuous-time fusion in contact-rich manipulation.
+
+\bibliographystyle{IEEEtran}
+\bibliography{references}
+
+\end{document}
